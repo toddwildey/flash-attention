@@ -27,7 +27,7 @@ from flash_attn.cute import ampere_helpers as sm80_utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
 from flash_attn.cute.mask import AttentionMask
-from flash_attn.cute.softmax import Softmax, apply_score_mod_inner
+from flash_attn.cute.softmax import Softmax, apply_score_mod_inner, load_learnable_sink
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
@@ -648,7 +648,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         mQ/mK/mV/mO has same data types(supports fp16 and bf16) and same layout:
         (batch_size, seqlen_q, num_head, head_dim):(_, _, _, 1)
         """
-        assert learnable_sink is None, "Learnable sink is not supported in this kernel"
         self._check_type(
             *(t.element_type if t is not None else None for t in (mQ, mK, mV, mO, mLSE, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK))
         )
@@ -728,6 +727,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             softmax_scale,
             window_size_left,
             window_size_right,
+            learnable_sink,
             self.sQ_layout,
             self.sK_layout,
             self.sV_layout,
@@ -767,6 +767,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         softmax_scale: Optional[Float32],
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
+        learnable_sink: Optional[cute.Tensor],
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
         sV_layout: cute.ComposedLayout,
@@ -1070,7 +1071,17 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             # TODO: local
 
             # normalize acc_O by row_sum and calculate the lse
-            row_scale = softmax.finalize()
+            if const_expr(learnable_sink is not None):
+                sink_val = load_learnable_sink(
+                    learnable_sink,
+                    head_idx=num_head,
+                    packed_row=Int32(0),
+                    qhead_per_kvhead=self.qhead_per_kvhead,
+                    pack_gqa=self.pack_gqa,
+                )
+                row_scale = softmax.finalize(sink_val=sink_val)
+            else:
+                row_scale = softmax.finalize()
             softmax.rescale_O(acc_O, row_scale)
 
             # ///////////////////////////////////////////////////////////////////////////////
